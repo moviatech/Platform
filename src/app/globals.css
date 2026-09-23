@@ -1,0 +1,112 @@
+@import "tailwindcss";
+
+@theme {
+  --color-warm-white: #fafaf7;
+  --color-pearl: #f3f3f1;
+  --color-silver: #e8e9e7;
+  --color-ink: #111111;
+  --color-charcoal: #303030;
+  --color-muted: #747474;
+  --color-gold: #b58b4b;
+  --color-gold-light: #c5a264;
+  --color-ice: #78d8ff;
+  --color-status-available: #3f9d5b;
+  --color-status-limited: #d69a2d;
+  --color-status-unavailable: #9a9a97;
+  --color-status-danger: #c4463a;
+  --color-status-info: #3b78c4;
+
+  --font-sans: var(--font-geist), var(--font-noto-sc), "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+
+  --radius-card: 16px;
+  --radius-card-sm: 12px;
+  --radius-pill: 999px;
+
+  --shadow-soft: 0 1px 2px rgba(17, 17, 17, 0.04), 0 12px 40px -16px rgba(17, 17, 17, 0.14);
+  --shadow-lift: 0 2px 6px rgba(17, 17, 17, 0.05), 0 28px 60px -24px rgba(17, 17, 17, 0.22);
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  background: var(--color-warm-white);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(181, 139, 75, 0.22);
+}
+
+button:not(:disabled),
+select:not(:disabled),
+summary,
+label[for] {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled,
+input:disabled {
+  cursor: not-allowed;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-gold);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+@utility eyebrow {
+  font-size: 0.6875rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--color-gold);
+  font-weight: 500;
+}
+
+@utility hairline {
+  border: 1px solid rgba(17, 17, 17, 0.08);
+}
+
+@utility card {
+  background: #ffffff;
+  border: 1px solid rgba(17, 17, 17, 0.07);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-soft);
+}
+
+.portal {
+  --radius-card: 12px;
+  background: #fafaf8;
+}
+
+.portal .card {
+  border-color: rgba(17, 17, 17, 0.06);
+  box-shadow:
+    0 1px 2px rgba(17, 17, 17, 0.03),
+    0 10px 24px -14px rgba(17, 17, 17, 0.14);
+}
+
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

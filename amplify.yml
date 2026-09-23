@@ -1,0 +1,18 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci
+    build:
+      commands:
+        - env | grep -e '^NEXT_PUBLIC_' -e '^SUPABASE_SECRET_KEY=' -e '^PLATFORM_API_KEY=' -e '^INBOUND_EMAIL_KEY=' -e '^STRIPE_SECRET_KEY=' -e '^STRIPE_WEBHOOK_SECRET=' -e '^STRIPE_EXTENDED_AUTH=' -e '^ROOT_DOMAIN=' -e '^SES_REGION=' -e '^SES_ACCESS_KEY_ID=' -e '^SES_SECRET_ACCESS_KEY=' -e '^EMAIL_FROM=' -e '^NOTIFY_EMAIL=' -e '^WEBSITE_ORIGIN=' -e '^PORTAL_ORIGIN=' -e '^INTERNAL_TICK_KEY=' >> .env.production || true
+        - npm run build
+  artifacts:
+    baseDirectory: .next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .next/cache/**/*
