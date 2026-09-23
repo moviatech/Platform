@@ -1,0 +1,74 @@
+import "server-only";
+import { sendEmail } from "@/lib/email";
+import { rootDomain } from "@/lib/env";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { renewalDue, renewalRetryHours } from "./renewal-plan";
+import { PaymentError, placeSecurityHold, releaseHold } from "./service";
+
+type HoldRow = {
+  id: string;
+  reservation_id: string;
+  amount_cents: number;
+  authorization_expires_at: string | null;
+  reservation: { number: string; status: string; return_at: string; customer: { stripe_payment_method_id: string | null } | null } | null;
+};
+
+async function audit(action: string, reservationId: string, metadata: Record<string, unknown>) {
+  await createAdminClient().from("audit_events").insert({ actor_type: "SYSTEM", action, entity_type: "reservation", entity_id: reservationId, metadata });
+}
+
+export async function renewExpiringHolds(windowHours = 36) {
+  const supabase = createAdminClient();
+  const now = Date.now();
+  const horizon = new Date(now + windowHours * 3600000).toISOString();
+  const { data } = await supabase
+    .from("payments")
+    .select("id, reservation_id, amount_cents, authorization_expires_at, reservation:reservations(number, status, return_at, customer:customers(stripe_payment_method_id))")
+    .eq("kind", "SECURITY_HOLD")
+    .eq("status", "AUTHORIZED")
+    .lt("authorization_expires_at", horizon);
+  const rows = (data ?? []) as unknown as HoldRow[];
+  const result = { checked: rows.length, renewed: 0, failed: 0, skipped: 0 };
+  const cards = new Map(rows.map((row) => [row.reservation_id, row.reservation?.customer?.stripe_payment_method_id ?? null]));
+  const failures = new Map<string, string>();
+  if (rows.length) {
+    const { data: recent } = await supabase
+      .from("audit_events")
+      .select("entity_id, created_at, metadata")
+      .eq("action", "security_hold.renewal_failed")
+      .in("entity_id", [...cards.keys()])
+      .gt("created_at", new Date(now - renewalRetryHours * 3600000).toISOString());
+    for (const item of recent ?? []) {
+      const used = (item.metadata as { paymentMethodId?: string | null } | null)?.paymentMethodId;
+      if (used && used !== cards.get(item.entity_id)) continue;
+      if (!failures.has(item.entity_id) || failures.get(item.entity_id)! < item.created_at) failures.set(item.entity_id, item.created_at);
+    }
+  }
+  for (const row of rows) {
+    const reservation = row.reservation;
+    if (!reservation || !renewalDue({ status: reservation.status, expiresAt: row.authorization_expires_at, returnAt: reservation.return_at, lastFailureAt: failures.get(row.reservation_id) ?? null, now })) {
+      result.skipped += 1;
+      continue;
+    }
+    try {
+      const placed = await placeSecurityHold(row.reservation_id, null, { replacing: row.id });
+      await releaseHold(row.id);
+      await audit("security_hold.renewed", row.reservation_id, { previousPaymentId: row.id, paymentId: placed.paymentId, status: placed.status, number: reservation.number });
+      result.renewed += 1;
+    } catch (cause) {
+      const code = cause instanceof PaymentError ? cause.code : "failed";
+      await audit("security_hold.renewal_failed", row.reservation_id, { paymentId: row.id, code, number: reservation.number, expiresAt: row.authorization_expires_at, paymentMethodId: cards.get(row.reservation_id) ?? null });
+      result.failed += 1;
+      const notify = process.env.NOTIFY_EMAIL;
+      if (notify) {
+        await sendEmail({
+          log: "staff",
+          to: notify.split(",").map((item) => item.trim()).filter(Boolean),
+          subject: `[Movia] 押金续期失败 / Hold renewal failed · ${reservation.number}`,
+          text: [`${reservation.number} · ${code}`, `Hold expires ${row.authorization_expires_at}`, `https://ops.${rootDomain}/reservations/${row.reservation_id}`].join("\n"),
+        }).catch(() => undefined);
+      }
+    }
+  }
+  return result;
+}

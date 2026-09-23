@@ -1,0 +1,370 @@
+import "server-only";
+import type Stripe from "stripe";
+import { getStripe, stripeConfigured } from "@/lib/stripe";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { refreshDriversPending, syncCustomerInsurance } from "@/features/drivers/service";
+import { usIssued } from "@/features/drivers/types";
+import { notifyStaff } from "@/features/notifications/center";
+import { notifyReservation } from "@/features/notifications/emails";
+import { notifyOpsEmail } from "@/features/notifications/ops";
+import { notifyPaymentReceipt } from "@/features/notifications/receipts";
+import { opsOrigin } from "@/lib/env";
+import { formatFullDateTime, formatMoney } from "@/lib/utils/format";
+import { applyPrepay } from "./prepay";
+import { applyChargeRefunds, applyIntent, confirmCardBooking, confirmReservationAfterPayment, paymentReceived, refundClosedOrderPayment, savePaymentMethod, settledStatus } from "./service";
+
+type Outcome = "processed" | "ignored" | "duplicate";
+
+async function audit(action: string, entityType: string, entityId: string, metadata: Record<string, unknown>) {
+  await createAdminClient().from("audit_events").insert({ actor_type: "SYSTEM", action, entity_type: entityType, entity_id: entityId, metadata });
+}
+
+const idOf = (value: string | { id: string } | null | undefined) => (typeof value === "string" ? value : (value?.id ?? null));
+
+async function onCheckoutCompleted(session: Stripe.Checkout.Session, created: number): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const { data: payment } = await supabase
+    .from("payments")
+    .select("id, reservation_id, customer_id, amount_cents, status, amount_refunded_cents")
+    .eq("stripe_checkout_session_id", session.id)
+    .maybeSingle();
+  if (!payment) {
+    const customerId = session.mode === "setup" && session.metadata?.purpose === "card_setup" ? session.metadata.customer_id : null;
+    if (!customerId || !stripeConfigured() || !idOf(session.setup_intent)) return "ignored";
+    const setup = await getStripe().setupIntents.retrieve(idOf(session.setup_intent) as string);
+    await savePaymentMethod(customerId, idOf(setup.payment_method));
+    await audit("customer.card_saved", "customer", customerId, { by: "Stripe", setupIntent: setup.id });
+    return "processed";
+  }
+
+  let paymentMethodId: string | null = null;
+  if (session.mode === "payment") {
+    const paid = session.payment_status === "paid";
+    await supabase
+      .from("payments")
+      .update({
+        status: paid ? settledStatus(session.amount_total ?? payment.amount_cents, payment.amount_refunded_cents ?? 0) : "PENDING",
+        stripe_payment_intent_id: idOf(session.payment_intent),
+        amount_captured_cents: paid ? (session.amount_total ?? payment.amount_cents) : 0,
+        checkout_url: null,
+      })
+      .eq("id", payment.id);
+    if (stripeConfigured() && idOf(session.payment_intent)) {
+      const intent = await getStripe()
+        .paymentIntents.retrieve(idOf(session.payment_intent) as string)
+        .catch(() => null);
+      paymentMethodId = idOf(intent?.payment_method);
+    }
+  } else {
+    await supabase.from("payments").update({ status: "SUCCEEDED", stripe_setup_intent_id: idOf(session.setup_intent), checkout_url: null }).eq("id", payment.id);
+    if (stripeConfigured() && idOf(session.setup_intent)) {
+      const setup = await getStripe().setupIntents.retrieve(idOf(session.setup_intent) as string);
+      paymentMethodId = idOf(setup.payment_method);
+    }
+  }
+
+  await savePaymentMethod(payment.customer_id, paymentMethodId);
+  if (paymentMethodId) await supabase.from("payments").update({ stripe_payment_method_id: paymentMethodId }).eq("id", payment.id);
+  await supabase.rpc("sync_reservation_payment_state", { p_reservation_id: payment.reservation_id });
+  if (session.mode === "payment" && session.payment_status !== "paid") {
+    await audit("payment.pending", "reservation", payment.reservation_id, { paymentId: payment.id, paymentStatus: session.payment_status, by: "Stripe" });
+    return "processed";
+  }
+  if (session.mode === "payment" && (await refundClosedOrderPayment(payment.id, { fresh: !paymentReceived(payment.status), paidAt: created * 1000 })) !== "open") return "processed";
+
+  const { data: reservation } = await supabase.from("reservations").select("status, number").eq("id", payment.reservation_id).single();
+  if (reservation && ["REQUESTED", "PENDING_PAYMENT"].includes(reservation.status) && session.metadata?.replace !== "1") {
+    await supabase.rpc("set_reservation_status", { p_reservation_id: payment.reservation_id, p_status: "CONFIRMED", p_reason: null });
+    await audit("reservation.status_changed", "reservation", payment.reservation_id, { from: reservation.status, to: "CONFIRMED", by: "Stripe", number: reservation.number });
+    await notifyReservation("confirmed", payment.reservation_id).catch(() => undefined);
+  }
+  await audit(session.mode === "payment" ? "payment.succeeded" : "payment.card_saved", "reservation", payment.reservation_id, {
+    paymentId: payment.id,
+    amountCents: session.amount_total ?? 0,
+    by: "Stripe",
+  });
+  if (session.mode === "payment") await notifyPaymentReceipt(payment.id).catch(() => undefined);
+  else if (reservation) await notifyStaff({ kind: "card.saved", reservationId: payment.reservation_id, href: `/reservations/${payment.reservation_id}`, dedupeKey: `card:${payment.id}`, params: { number: reservation.number } }).catch(() => false);
+  return "processed";
+}
+
+async function onCheckoutExpired(session: Stripe.Checkout.Session): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const { data: payment } = await supabase.from("payments").select("id, reservation_id, status").eq("stripe_checkout_session_id", session.id).maybeSingle();
+  if (!payment || payment.status !== "PENDING") return "ignored";
+  await supabase.from("payments").update({ status: "CANCELLED", checkout_url: null }).eq("id", payment.id);
+
+  const { data: live } = await supabase
+    .from("payments")
+    .select("id")
+    .eq("reservation_id", payment.reservation_id)
+    .eq("kind", "RENTAL")
+    .eq("status", "PENDING")
+    .not("checkout_url", "is", null)
+    .gt("checkout_expires_at", new Date().toISOString())
+    .limit(1);
+  if (live?.length) return "processed";
+
+  const { data: reservation } = await supabase.from("reservations").select("status, number").eq("id", payment.reservation_id).single();
+  if (reservation?.status === "PENDING_PAYMENT") {
+    await supabase.rpc("set_reservation_status", { p_reservation_id: payment.reservation_id, p_status: "EXPIRED", p_reason: "checkout_expired" });
+    await audit("reservation.status_changed", "reservation", payment.reservation_id, { from: "PENDING_PAYMENT", to: "EXPIRED", by: "Stripe", number: reservation.number });
+  }
+  return "processed";
+}
+
+async function refundOrphan(intent: Stripe.PaymentIntent): Promise<Outcome> {
+  if (!stripeConfigured()) return "ignored";
+  const amount = intent.amount_received ?? intent.amount;
+  let refundId: string | null = null;
+  let failure: string | null = null;
+  try {
+    const refund = await getStripe().refunds.create({ payment_intent: intent.id, metadata: { orphan: "1" } }, { idempotencyKey: `orphan-${intent.id}` });
+    refundId = refund.id;
+  } catch (cause) {
+    failure = cause instanceof Error ? cause.message.slice(0, 200) : "failed";
+  }
+  await audit(failure ? "payment.orphan_refund_failed" : "payment.orphan_refunded", "payment_intent", intent.id, { amountCents: amount, refundId, error: failure, by: "Stripe" });
+  await notifyStaff({ kind: failure ? "payment.orphan_failed" : "payment.orphan_refunded", href: "/reservations", dedupeKey: `orphan:${intent.id}`, params: { amount: formatMoney(amount), intent: intent.id } });
+  await notifyOpsEmail(failure ? `官网付款无订单，自动退款失败 ${formatMoney(amount)}` : `官网付款无订单，已自动退款 ${formatMoney(amount)}`, [`PaymentIntent ${intent.id}`, `金额 ${formatMoney(amount)}`, failure ? `退款失败：${failure}，请到 Stripe 手动退款` : `退款 ${refundId}`, "客户在官网付款时订单没有生成。请在 Stripe 查看付款人并联系对方。"]);
+  return "processed";
+}
+
+async function onIntent(intent: Stripe.PaymentIntent, created: number): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const paymentId = intent.metadata?.payment_id;
+  const find = () => {
+    const query = supabase.from("payments").select("id, reservation_id, customer_id, kind, status");
+    return paymentId ? query.eq("id", paymentId).maybeSingle() : query.eq("stripe_payment_intent_id", intent.id).maybeSingle();
+  };
+  let { data: payment } = await find();
+  if (!payment && intent.status === "succeeded" && intent.metadata?.draft === "1") {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    ({ data: payment } = await find());
+    if (!payment) return refundOrphan(intent);
+  }
+  if (!payment) return "ignored";
+  await applyIntent(payment.id, intent);
+  if (intent.status === "succeeded" && payment.kind === "RENTAL") {
+    if ((await refundClosedOrderPayment(payment.id, { fresh: !paymentReceived(payment.status), paidAt: created * 1000 })) !== "open") return "processed";
+    if (intent.metadata?.prepay === "1") {
+      const { data: current } = await supabase.from("reservations").select("rate_plan").eq("id", payment.reservation_id).maybeSingle();
+      if (current?.rate_plan === "PAY_LATER") await applyPrepay(payment.reservation_id);
+    }
+    await savePaymentMethod(payment.customer_id, idOf(intent.payment_method));
+    await notifyStaff({ kind: "payment.received", reservationId: payment.reservation_id, href: `/reservations/${payment.reservation_id}`, dedupeKey: `payment:${payment.id}`, params: { number: intent.metadata?.reservation_number ?? "", amount: formatMoney(intent.amount_received ?? intent.amount) } });
+    if (await confirmReservationAfterPayment(payment.reservation_id, "payment")) {
+      await audit("payment.succeeded", "reservation", payment.reservation_id, { paymentId: payment.id, amountCents: intent.amount_received ?? 0, by: "Stripe" });
+    }
+    await notifyPaymentReceipt(payment.id).catch(() => undefined);
+  }
+  if (intent.status === "requires_payment_method" || intent.last_payment_error) {
+    await audit("payment.failed", "reservation", payment.reservation_id, { paymentId: payment.id, code: intent.last_payment_error?.code ?? null, by: "Stripe" });
+  }
+  return "processed";
+}
+
+async function onCheckoutPaymentFailed(session: Stripe.Checkout.Session): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const { data: payment } = await supabase.from("payments").select("id, reservation_id, status").eq("stripe_checkout_session_id", session.id).maybeSingle();
+  if (!payment || payment.status !== "PENDING") return "ignored";
+  await supabase.from("payments").update({ status: "FAILED", failure_code: "async_payment_failed", checkout_url: null }).eq("id", payment.id);
+  await audit("payment.failed", "reservation", payment.reservation_id, { paymentId: payment.id, code: "async_payment_failed", by: "Stripe" });
+  return "processed";
+}
+
+async function onSetupIntent(intent: Stripe.SetupIntent): Promise<Outcome> {
+  const customerId = intent.metadata?.purpose === "card_setup" ? intent.metadata.customer_id : null;
+  if (!customerId || intent.status !== "succeeded") return "ignored";
+  await savePaymentMethod(customerId, idOf(intent.payment_method));
+  await audit("customer.card_saved", "customer", customerId, { by: "Stripe", setupIntent: intent.id });
+  if (intent.metadata?.reservation_id) await confirmCardBooking(intent.metadata.reservation_id, customerId);
+  return "processed";
+}
+
+async function onChargeRefunded(charge: Stripe.Charge): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const intentId = idOf(charge.payment_intent);
+  if (!intentId) return "ignored";
+  const { data: payment } = await supabase.from("payments").select("id").eq("stripe_payment_intent_id", intentId).maybeSingle();
+  if (!payment) return "ignored";
+  await applyChargeRefunds(payment.id, charge);
+  return "processed";
+}
+
+async function onRefundUpdated(refund: Stripe.Refund): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const { data: row } = await supabase.from("refunds").select("id, payment_id, status").eq("stripe_refund_id", refund.id).maybeSingle();
+  if (!row) return "ignored";
+  const status = (refund.status ?? "pending").toUpperCase();
+  await supabase.from("refunds").update({ status }).eq("id", row.id);
+  const { data: payment } = await supabase.from("payments").select("id, reservation_id").eq("id", row.payment_id).maybeSingle();
+  if (!payment) return "processed";
+  if (stripeConfigured() && idOf(refund.charge)) {
+    try {
+      const charge = await getStripe().charges.retrieve(idOf(refund.charge) as string);
+      await applyChargeRefunds(payment.id, charge);
+    } catch {}
+  }
+  if (status === "FAILED" || status === "CANCELED") {
+    await audit("payment.refund_failed", "reservation", payment.reservation_id, { paymentId: payment.id, refundId: row.id, amountCents: refund.amount, reason: refund.failure_reason ?? null, by: "Stripe" });
+  }
+  return "processed";
+}
+
+const disputeTitles = { opened: "收到拒付 / Chargeback opened", won: "拒付胜诉 / Chargeback won", lost: "拒付败诉 / Chargeback lost", closed: "拒付结案 / Chargeback closed" };
+
+async function onDispute(dispute: Stripe.Dispute, closed: boolean): Promise<Outcome> {
+  const intentId = idOf(dispute.payment_intent);
+  const { data } = intentId ? await createAdminClient().from("payments").select("id, reservation_id, reservation:reservations(number)").eq("stripe_payment_intent_id", intentId).maybeSingle() : { data: null };
+  const payment = data as unknown as { id: string; reservation_id: string; reservation: { number: string } | null } | null;
+  const stage = !closed ? "opened" : dispute.status === "won" ? "won" : dispute.status === "lost" ? "lost" : "closed";
+  const number = payment?.reservation?.number ?? "";
+  const amount = formatMoney(dispute.amount);
+  const dueBy = dispute.evidence_details?.due_by ?? null;
+  await audit(`payment.dispute_${stage}`, payment ? "reservation" : "payment_intent", payment ? payment.reservation_id : (intentId ?? dispute.id), {
+    paymentId: payment?.id ?? null,
+    amountCents: dispute.amount,
+    reason: dispute.reason,
+    disputeId: dispute.id,
+    status: dispute.status,
+    dueBy,
+    number,
+    by: "Stripe",
+  });
+  await notifyStaff({ kind: `payment.dispute_${stage}`, reservationId: payment?.reservation_id ?? null, locationId: null, href: payment ? `/reservations/${payment.reservation_id}` : "/reservations", dedupeKey: `dispute:${dispute.id}:${stage}`, params: { number, amount, reason: dispute.reason } });
+  await notifyOpsEmail(`${disputeTitles[stage]} · ${number || intentId || dispute.id} · ${amount}`, [
+    `${number || "无对应订单 / no matching order"} · ${amount}`,
+    `原因 / Reason: ${dispute.reason} · 状态 / Status: ${dispute.status}`,
+    !closed && dueBy ? `举证截止 / Respond by: ${formatFullDateTime(new Date(dueBy * 1000).toISOString())}` : "",
+    payment ? `${opsOrigin}/reservations/${payment.reservation_id}` : "",
+    intentId ? `https://dashboard.stripe.com/${dispute.livemode ? "" : "test/"}payments/${intentId}` : "",
+  ]);
+  return "processed";
+}
+
+async function onDriverIdentity(session: Stripe.Identity.VerificationSession): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const { data: driver } = await supabase.from("reservation_drivers").select("id, reservation_id").eq("identity_session_id", session.id).maybeSingle();
+  if (!driver) return "ignored";
+  if (session.status === "verified") {
+    const patch: Record<string, unknown> = { status: "VERIFIED", verified_at: new Date().toISOString() };
+    if (stripeConfigured() && idOf(session.last_verification_report)) {
+      try {
+        const report = await getStripe().identity.verificationReports.retrieve(idOf(session.last_verification_report) as string, { expand: ["document.expiration_date", "document.number", "document.dob"] });
+        const iso = (date: { year?: number | null; month?: number | null; day?: number | null } | null | undefined) =>
+          date?.year && date.month && date.day ? `${date.year}-${String(date.month).padStart(2, "0")}-${String(date.day).padStart(2, "0")}` : null;
+        patch.license_expires_on = iso(report.document?.expiration_date);
+        patch.license_country = report.document?.issuing_country ?? null;
+        patch.license_last4 = report.document?.number ? report.document.number.slice(-4) : null;
+        patch.full_name = [report.document?.first_name, report.document?.last_name].filter(Boolean).join(" ") || null;
+      } catch {}
+    }
+    await supabase.from("reservation_drivers").update(patch).eq("id", driver.id);
+    await refreshDriversPending(driver.reservation_id);
+    await audit("driver.identity_verified", "reservation", driver.reservation_id, { driverId: driver.id, sessionId: session.id, by: "Stripe" });
+    return "processed";
+  }
+  if (session.status === "requires_input") {
+    await supabase.from("reservation_drivers").update({ status: "REJECTED" }).eq("id", driver.id);
+    await refreshDriversPending(driver.reservation_id);
+    await audit("driver.identity_rejected", "reservation", driver.reservation_id, { driverId: driver.id, sessionId: session.id, reason: session.last_error?.reason ?? null, by: "Stripe" });
+    return "processed";
+  }
+  return "ignored";
+}
+
+async function onIdentity(session: Stripe.Identity.VerificationSession): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const { data: customer } = await supabase.from("customers").select("id, license_kind").eq("identity_session_id", session.id).maybeSingle();
+  if (!customer) return onDriverIdentity(session);
+
+  if (session.status === "verified") {
+    const patch: Record<string, unknown> = { identity_status: "VERIFIED", identity_verified_at: new Date().toISOString(), identity_error: null };
+    let country: string | null = null;
+    if (stripeConfigured() && idOf(session.last_verification_report)) {
+      try {
+        const report = await getStripe().identity.verificationReports.retrieve(idOf(session.last_verification_report) as string, { expand: ["document.expiration_date", "document.number", "document.dob"] });
+        const iso = (date: { year?: number | null; month?: number | null; day?: number | null } | null | undefined) =>
+          date?.year && date.month && date.day ? `${date.year}-${String(date.month).padStart(2, "0")}-${String(date.day).padStart(2, "0")}` : null;
+        patch.license_expires_on = iso(report.document?.expiration_date);
+        country = report.document?.issuing_country ? report.document.issuing_country.toUpperCase() : null;
+        patch.license_state = country;
+        patch.license_last4 = report.document?.number ? report.document.number.slice(-4) : null;
+        const dob = iso(report.document?.dob);
+        if (dob) patch.date_of_birth = dob;
+      } catch (cause) {
+        console.error("[identity:report]", cause instanceof Error ? cause.message : cause);
+      }
+    }
+    if (country) {
+      patch.license_kind = usIssued(country) ? "US" : customer.license_kind === "TRANSLATED" ? "TRANSLATED" : "INTERNATIONAL";
+      patch.license_kind_confirmed = true;
+    }
+    await supabase.from("customers").update(patch).eq("id", customer.id);
+    if (country && usIssued(country)) await supabase.from("reservations").update({ verification_state: "VERIFIED" }).eq("customer_id", customer.id).in("status", ["REQUESTED", "PENDING_PAYMENT", "CONFIRMED"]);
+    if (country) await syncCustomerInsurance(customer.id);
+    await audit("customer.identity_verified", "customer", customer.id, { sessionId: session.id, by: "Stripe", country });
+    return "processed";
+  }
+  if (session.status === "requires_input") {
+    const reason = session.last_error?.reason ?? null;
+    await supabase.from("customers").update({ identity_status: "REJECTED", identity_error: reason }).eq("id", customer.id);
+    await supabase.from("reservations").update({ verification_state: "REJECTED" }).eq("customer_id", customer.id).in("status", ["REQUESTED", "PENDING_PAYMENT", "CONFIRMED"]);
+    await audit("customer.identity_rejected", "customer", customer.id, { sessionId: session.id, reason, by: "Stripe" });
+    return "processed";
+  }
+  return "ignored";
+}
+
+export async function processStripeEvent(event: Stripe.Event): Promise<Outcome> {
+  const supabase = createAdminClient();
+  const { error } = await supabase.from("stripe_events").insert({ id: event.id, type: event.type });
+  if (error) {
+    if (error.code !== "23505") throw new Error(`stripe_event_insert:${error.message}`);
+    const { data: previous } = await supabase.from("stripe_events").select("processed_at").eq("id", event.id).single();
+    if (previous?.processed_at) return "duplicate";
+  }
+
+  let outcome: Outcome = "ignored";
+  switch (event.type) {
+    case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded":
+      outcome = await onCheckoutCompleted(event.data.object, event.created);
+      break;
+    case "checkout.session.expired":
+      outcome = await onCheckoutExpired(event.data.object);
+      break;
+    case "checkout.session.async_payment_failed":
+      outcome = await onCheckoutPaymentFailed(event.data.object);
+      break;
+    case "refund.updated":
+    case "refund.failed":
+    case "charge.refund.updated":
+      outcome = await onRefundUpdated(event.data.object as Stripe.Refund);
+      break;
+    case "payment_intent.succeeded":
+    case "payment_intent.payment_failed":
+    case "payment_intent.canceled":
+    case "payment_intent.amount_capturable_updated":
+      outcome = await onIntent(event.data.object, event.created);
+      break;
+    case "setup_intent.succeeded":
+      outcome = await onSetupIntent(event.data.object);
+      break;
+    case "charge.refunded":
+      outcome = await onChargeRefunded(event.data.object);
+      break;
+    case "charge.dispute.created":
+    case "charge.dispute.closed":
+      outcome = await onDispute(event.data.object, event.type === "charge.dispute.closed");
+      break;
+    case "identity.verification_session.verified":
+    case "identity.verification_session.requires_input":
+      outcome = await onIdentity(event.data.object);
+      break;
+  }
+
+  await supabase.from("stripe_events").update({ processed_at: new Date().toISOString(), result: outcome }).eq("id", event.id);
+  return outcome;
+}

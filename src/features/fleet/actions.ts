@@ -1,0 +1,259 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { z } from "zod";
+import { loadVehicleLocation } from "@/features/booking/service";
+import { zonedToUtc } from "@/features/booking/time";
+import { recordReading } from "@/features/investor/mileage";
+import { audit } from "@/lib/audit";
+import { requirePermission } from "@/lib/auth/staff";
+import { requireScope } from "@/lib/auth/scope";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { prepPhotoBucket } from "@/features/prep/template";
+import { privateBucket, publicBucket } from "./photos";
+import { blockTypes, cleanStates, vehicleConditions } from "./types";
+import { videoLink, videoRef } from "./video";
+
+export type FleetFormState = { ok?: boolean; error?: "invalid" | "duplicate" | "conflict" | "failed" | "video" | "in_use" };
+
+const videoStored = (value: string | null | undefined) => {
+  const ref = videoRef(value);
+  return ref ? videoLink(ref) : null;
+};
+
+const optionalText = (max: number) =>
+  z
+    .string()
+    .trim()
+    .max(max)
+    .transform((value) => value || null);
+
+const optionalInt = (min: number, max: number) =>
+  z
+    .string()
+    .trim()
+    .transform((value) => (value === "" ? null : Number(value)))
+    .refine((value) => value === null || (Number.isInteger(value) && value >= min && value <= max));
+
+const vehicleInput = z.object({
+  id: z.union([z.uuid(), z.literal("")]),
+  classId: z.uuid(),
+  locationId: z.uuid(),
+  fleetNumber: z.string().trim().min(2).max(20),
+  vin: optionalText(17),
+  licensePlate: optionalText(12),
+  year: optionalInt(2015, 2035),
+  exteriorColor: optionalText(40),
+  condition: z.enum(vehicleConditions),
+  cleanState: z.enum(cleanStates),
+  batteryLevel: optionalInt(0, 100),
+  odometer: optionalInt(0, 2000000),
+  isPlaceholder: z.boolean(),
+  notes: optionalText(2000),
+  videoUrl: optionalText(200),
+});
+
+const usedBy: Array<[string, string]> = [
+  ["reservations", "assigned_vehicle_id"],
+  ["vehicle_allocations", "vehicle_id"],
+  ["inspections", "vehicle_id"],
+  ["investor_allocations", "vehicle_id"],
+  ["investor_ledger_entries", "vehicle_id"],
+  ["investor_mileage_statements", "vehicle_id"],
+  ["expenses", "vehicle_id"],
+  ["vehicle_service_logs", "vehicle_id"],
+  ["media", "vehicle_id"],
+  ["fin_vehicle_costs", "vehicle_id"],
+  ["fin_recurring", "vehicle_id"],
+];
+
+export async function deleteVehicle(_: FleetFormState, form: FormData): Promise<FleetFormState> {
+  const session = await requirePermission("vehicle.edit");
+  const id = z.uuid().safeParse(form.get("id"));
+  if (!id.success) return { error: "invalid" };
+  if (session.locationIds !== null) return { error: "failed" };
+  const supabase = createAdminClient();
+  const { data: vehicle } = await supabase.from("vehicles").select("id, fleet_number, vin, license_plate").eq("id", id.data).maybeSingle();
+  if (!vehicle) return { error: "invalid" };
+  const used = await Promise.all(
+    usedBy.map(async ([table, column]) => {
+      const query = supabase.from(table).select(column, { count: "exact", head: true }).eq(column, vehicle.id);
+      const { count, error } = await (table === "vehicle_allocations" ? query.not("reservation_id", "is", null) : query);
+      return error ? 1 : (count ?? 0);
+    }),
+  );
+  if (used.some((count) => count > 0)) return { error: "in_use" };
+  const [{ data: photos }, { data: media }, { data: tasks }] = await Promise.all([
+    supabase.from("vehicle_photos").select("storage_path, visibility").eq("vehicle_id", vehicle.id),
+    supabase.from("vehicle_media").select("storage_path").eq("vehicle_id", vehicle.id),
+    supabase.from("prep_tasks").select("id, photos:prep_photos(storage_path)").eq("vehicle_id", vehicle.id),
+  ]);
+  const { error: blocksError } = await supabase.from("vehicle_blocks").delete().eq("vehicle_id", vehicle.id);
+  if (blocksError) return { error: "failed" };
+  const { error } = await supabase.from("vehicles").delete().eq("id", vehicle.id);
+  if (error) return { error: error.code === "23503" ? "in_use" : "failed" };
+  const files = (photos ?? []) as Array<{ storage_path: string; visibility: string }>;
+  const open = [...files.filter((row) => row.visibility === "CUSTOMER").map((row) => row.storage_path), ...((media ?? []) as Array<{ storage_path: string }>).map((row) => row.storage_path)];
+  const closed = files.filter((row) => row.visibility !== "CUSTOMER").map((row) => row.storage_path);
+  const prep = ((tasks ?? []) as unknown as Array<{ photos: Array<{ storage_path: string }> | null }>).flatMap((task) => (task.photos ?? []).map((photo) => photo.storage_path));
+  if (open.length) await supabase.storage.from(publicBucket).remove(open);
+  if (closed.length) await supabase.storage.from(privateBucket).remove(closed);
+  if (prep.length) await supabase.storage.from(prepPhotoBucket).remove(prep);
+  await audit({ actorUserId: session.userId, actorType: "STAFF", action: "vehicle.deleted", entityType: "vehicle", entityId: vehicle.id, metadata: { by: session.displayName, fleetNumber: vehicle.fleet_number, vin: vehicle.vin, plate: vehicle.license_plate } });
+  revalidatePath("/ops/fleet", "layout");
+  redirect("/fleet");
+}
+
+export async function saveVehicle(_: FleetFormState, form: FormData): Promise<FleetFormState> {
+  const session = await requirePermission("vehicle.edit");
+  const parsed = vehicleInput.safeParse({
+    id: form.get("id") ?? "",
+    classId: form.get("classId"),
+    locationId: form.get("locationId"),
+    fleetNumber: form.get("fleetNumber"),
+    vin: form.get("vin") ?? "",
+    licensePlate: form.get("licensePlate") ?? "",
+    year: form.get("year") ?? "",
+    exteriorColor: form.get("exteriorColor") ?? "",
+    condition: form.get("condition"),
+    cleanState: form.get("cleanState"),
+    batteryLevel: form.get("batteryLevel") ?? "",
+    odometer: form.get("odometer") ?? "",
+    isPlaceholder: form.get("isPlaceholder") === "on",
+    notes: form.get("notes") ?? "",
+    videoUrl: form.get("videoUrl") ?? "",
+  });
+  if (!parsed.success) return { error: "invalid" };
+  if (parsed.data.videoUrl && !videoRef(parsed.data.videoUrl)) return { error: "video" };
+  await requireScope(session, { location: parsed.data.locationId });
+  if (parsed.data.id) await requireScope(session, { vehicle: parsed.data.id });
+  const input = parsed.data;
+
+  const supabase = createAdminClient();
+  const { data: location } = await supabase.from("locations").select("active").eq("id", input.locationId).maybeSingle();
+  if (!location) return { error: "invalid" };
+  if (!location.active) {
+    const { data: current } = input.id ? await supabase.from("vehicles").select("location_id").eq("id", input.id).maybeSingle() : { data: null };
+    if (current?.location_id !== input.locationId) return { error: "invalid" };
+  }
+  const values = {
+    class_id: input.classId,
+    location_id: input.locationId,
+    fleet_number: input.fleetNumber.toUpperCase(),
+    vin: input.vin?.toUpperCase() ?? null,
+    license_plate: input.licensePlate?.toUpperCase() ?? null,
+    year: input.year,
+    exterior_color: input.exteriorColor,
+    condition: input.condition,
+    clean_state: input.cleanState,
+    battery_level: input.batteryLevel,
+    odometer: input.odometer,
+    is_placeholder: input.isPlaceholder,
+    notes: input.notes,
+    video_url: videoStored(input.videoUrl),
+  };
+
+  if (input.id) {
+    const { data: before } = await supabase.from("vehicles").select("condition, clean_state, battery_level, odometer").eq("id", input.id).maybeSingle();
+    const { error } = await supabase.from("vehicles").update(values).eq("id", input.id);
+    if (error) return { error: error.code === "23505" ? "duplicate" : "failed" };
+    if (input.odometer !== null && input.odometer !== undefined && input.odometer !== before?.odometer) await recordReading({ vehicleId: input.id, reading: input.odometer, source: "MANUAL", createdBy: session.userId }).catch(() => null);
+    await audit({
+      actorUserId: session.userId,
+      actorType: "STAFF",
+      action: before?.condition !== input.condition ? "vehicle.status_changed" : "vehicle.updated",
+      entityType: "vehicle",
+      entityId: input.id,
+      metadata: { by: session.displayName, from: before?.condition, to: input.condition, battery: input.batteryLevel, odometer: input.odometer },
+    });
+    revalidatePath("/ops/fleet", "layout");
+    return { ok: true };
+  }
+
+  const { data: created, error } = await supabase.from("vehicles").insert(values).select("id").single();
+  if (error || !created) return { error: error?.code === "23505" ? "duplicate" : "failed" };
+  if (input.odometer !== null && input.odometer !== undefined) await recordReading({ vehicleId: created.id, reading: input.odometer, source: "MANUAL", createdBy: session.userId }).catch(() => null);
+  await audit({
+    actorUserId: session.userId,
+    actorType: "STAFF",
+    action: "vehicle.created",
+    entityType: "vehicle",
+    entityId: created.id,
+    metadata: { by: session.displayName, fleetNumber: values.fleet_number },
+  });
+  revalidatePath("/ops/fleet", "layout");
+  redirect(`/fleet/${created.id}`);
+}
+
+const blockInput = z.object({
+  vehicleId: z.uuid(),
+  startDate: z.iso.date(),
+  startTime: z.iso.time({ precision: -1 }),
+  endDate: z.iso.date(),
+  endTime: z.iso.time({ precision: -1 }),
+  type: z.enum(blockTypes),
+  reason: z.string().trim().max(300),
+});
+
+export async function addBlock(_: FleetFormState, form: FormData): Promise<FleetFormState> {
+  const session = await requirePermission("vehicle.edit");
+  const parsed = blockInput.safeParse({
+    vehicleId: form.get("vehicleId"),
+    startDate: form.get("startDate"),
+    startTime: form.get("startTime"),
+    endDate: form.get("endDate"),
+    endTime: form.get("endTime"),
+    type: form.get("type"),
+    reason: form.get("reason") ?? "",
+  });
+  if (!parsed.success) return { error: "invalid" };
+  await requireScope(session, { vehicle: parsed.data.vehicleId });
+  const input = parsed.data;
+
+  const location = await loadVehicleLocation(input.vehicleId);
+  const startsAt = zonedToUtc(input.startDate, input.startTime, location.timezone);
+  const endsAt = zonedToUtc(input.endDate, input.endTime, location.timezone);
+  if (endsAt <= startsAt) return { error: "invalid" };
+
+  const { data, error } = await createAdminClient().rpc("create_vehicle_block", {
+    p_vehicle_id: input.vehicleId,
+    p_starts_at: startsAt.toISOString(),
+    p_ends_at: endsAt.toISOString(),
+    p_type: input.type,
+    p_reason: input.reason,
+    p_created_by: session.userId,
+  });
+  if (error) return { error: error.code === "23P01" ? "conflict" : "failed" };
+
+  await audit({
+    actorUserId: session.userId,
+    actorType: "STAFF",
+    action: "vehicle.block_created",
+    entityType: "vehicle",
+    entityId: input.vehicleId,
+    metadata: { by: session.displayName, blockId: data, type: input.type, from: startsAt.toISOString(), to: endsAt.toISOString() },
+  });
+  revalidatePath("/ops/fleet", "layout");
+  revalidatePath("/ops/reservations", "layout");
+  return { ok: true };
+}
+
+export async function removeBlock(form: FormData) {
+  const session = await requirePermission("vehicle.edit");
+  const parsed = z.object({ blockId: z.uuid(), vehicleId: z.uuid() }).safeParse({ blockId: form.get("blockId"), vehicleId: form.get("vehicleId") });
+  if (!parsed.success) return;
+  await requireScope(session, { block: parsed.data.blockId });
+  const { error } = await createAdminClient().from("vehicle_blocks").delete().eq("id", parsed.data.blockId);
+  if (error) return;
+  await audit({
+    actorUserId: session.userId,
+    actorType: "STAFF",
+    action: "vehicle.block_removed",
+    entityType: "vehicle",
+    entityId: parsed.data.vehicleId,
+    metadata: { by: session.displayName, blockId: parsed.data.blockId },
+  });
+  revalidatePath("/ops/fleet", "layout");
+  revalidatePath("/ops/reservations", "layout");
+}

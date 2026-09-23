@@ -1,0 +1,114 @@
+import "server-only";
+import { cache } from "react";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+import { mfaCookie, mfaTokenValid } from "@/lib/auth/mfa";
+import { supabaseConfigured } from "@/lib/env";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { createClient } from "@/lib/supabase/server";
+
+export const investorStatuses = ["PENDING", "ACTIVE", "SUSPENDED", "REJECTED", "CLOSED"] as const;
+export type InvestorStatus = (typeof investorStatuses)[number];
+
+export type InvestorRow = {
+  id: string;
+  investor_number: string;
+  auth_user_id: string | null;
+  kind: InvestorKind;
+  company_id: string | null;
+  legal_name: string;
+  email: string | null;
+  phone: string | null;
+  preferred_language: string;
+  status: InvestorStatus;
+  default_share_bps: number | null;
+  compensation: "REVENUE_SHARE" | "PER_MILE";
+  mileage_payout_days: number | null;
+  house: boolean;
+  created_at: string;
+};
+
+export const investorKinds = ["INDIVIDUAL", "COMPANY"] as const;
+export type InvestorKind = (typeof investorKinds)[number];
+
+export type InvestorCompany = { id: string; number: string; name: string };
+
+export type InvestorAuth = { userId: string; email: string; investor: InvestorRow | null; company: InvestorRow | null; mfaVerified: boolean };
+
+export type InvestorSession = {
+  userId: string;
+  investorId: string;
+  ownerId: string;
+  memberId: string | null;
+  company: InvestorCompany | null;
+  kind: InvestorKind;
+  number: string;
+  legalName: string;
+  email: string;
+  phone: string;
+  language: "zh" | "en";
+  status: InvestorStatus;
+  compensation: "REVENUE_SHARE" | "PER_MILE";
+  perMile: boolean;
+  createdAt: string;
+};
+
+export const investorColumns = "id, investor_number, auth_user_id, kind, company_id, legal_name, email, phone, preferred_language, status, default_share_bps, compensation, mileage_payout_days, house, created_at";
+
+export const getInvestorAuth = cache(async (): Promise<InvestorAuth | null> => {
+  if (!supabaseConfigured) return null;
+  const supabase = await createClient();
+  const { data: auth } = await supabase.auth.getClaims();
+  const userId = auth?.claims.sub;
+  const email = typeof auth?.claims.email === "string" ? auth.claims.email.toLowerCase() : undefined;
+  if (!userId || !email) return null;
+  const admin = createAdminClient();
+  let { data: investor } = await admin.from("investors").select(investorColumns).eq("auth_user_id", userId).maybeSingle();
+  if (!investor) {
+    const { data: byEmail } = await admin.from("investors").select(investorColumns).eq("email", email).is("auth_user_id", null).maybeSingle();
+    if (byEmail) {
+      const { data: linked } = await admin.from("investors").update({ auth_user_id: userId }).eq("id", byEmail.id).select(investorColumns).maybeSingle();
+      investor = linked ?? byEmail;
+    }
+  }
+  const row = (investor as InvestorRow | null) ?? null;
+  const { data: company } = row?.company_id ? await admin.from("investors").select(investorColumns).eq("id", row.company_id).maybeSingle() : { data: null };
+  return {
+    userId,
+    email,
+    investor: row,
+    company: (company as InvestorRow | null) ?? null,
+    mfaVerified: mfaTokenValid((await cookies()).get(mfaCookie)?.value, userId),
+  };
+});
+
+export function toSession(auth: InvestorAuth, investor: InvestorRow): InvestorSession {
+  const owner = auth.company ?? investor;
+  return {
+    userId: auth.userId,
+    investorId: investor.id,
+    ownerId: owner.id,
+    memberId: auth.company ? investor.id : null,
+    company: auth.company ? { id: auth.company.id, number: auth.company.investor_number, name: auth.company.legal_name } : null,
+    kind: investor.kind,
+    number: investor.investor_number,
+    legalName: investor.legal_name,
+    email: investor.email ?? auth.email,
+    phone: investor.phone ?? "",
+    language: investor.preferred_language === "en" ? "en" : "zh",
+    status: investor.status,
+    compensation: owner.compensation,
+    perMile: owner.compensation === "PER_MILE",
+    createdAt: investor.created_at,
+  };
+}
+
+export async function requireInvestor(): Promise<InvestorSession> {
+  const auth = await getInvestorAuth();
+  if (!auth) redirect("/login");
+  if (!auth.investor) redirect("/apply");
+  if (auth.investor.status !== "ACTIVE") redirect("/pending");
+  if (auth.investor.company_id && auth.company?.status !== "ACTIVE") redirect("/pending");
+  if (!auth.mfaVerified) redirect("/verify-2fa");
+  return toSession(auth, auth.investor);
+}

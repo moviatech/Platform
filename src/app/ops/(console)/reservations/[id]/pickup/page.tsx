@@ -1,0 +1,145 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+import { notFound, redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
+import { Badge } from "@/components/ui/Badge";
+import { BackLink, withBack } from "@/components/ops/BackLink";
+import { PageHeader } from "@/components/ops/PageHeader";
+import { PickupForm } from "@/features/handover/HandoverForms";
+import { PickupPayments } from "@/features/handover/PickupPayments";
+import { VerifyPanel } from "@/features/drivers/VerifyPanel";
+import { listDrivers } from "@/features/drivers/service";
+import { driverDone, insuranceOk, protectionAllowed, type InsuranceGate } from "@/features/drivers/types";
+import { vehiclePhotoProgress } from "@/features/fleet/photos";
+import { listSpecialRequests, loadPickupMoney } from "@/features/handover/queries";
+import type { PayStage } from "@/features/handover/types";
+import { teslaReady } from "@/features/tesla/service";
+import { getReservation } from "@/features/reservations/queries";
+import { r2Configured } from "@/lib/media/r2";
+import { stripeConfigured } from "@/lib/stripe";
+import { requirePagePermission } from "@/lib/auth/staff";
+import { createClient } from "@/lib/supabase/server";
+import { formatFullDateTime } from "@/lib/utils/format";
+
+export const metadata: Metadata = { title: "Pickup" };
+
+type Props = { params: Promise<{ id: string }> };
+
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const stepHead = (step: number, title: string) => (
+  <p className="flex w-full items-center gap-2 pt-2 text-xs font-medium tracking-wide text-charcoal">
+    <span className="flex size-5 items-center justify-center rounded-full bg-ink text-[11px] text-white">{step}</span>
+    {title}
+  </p>
+);
+
+export default async function PickupPage({ params }: Props) {
+  const staff = await requirePagePermission("vehicle.inspect");
+  const { id } = await params;
+  if (!uuid.test(id)) notFound();
+  const [t, r, types] = await Promise.all([getTranslations("handover"), getTranslations("reservations"), getTranslations("portal.help.types")]);
+  const early = Promise.all([listSpecialRequests(id, { childSeat: t("installChildSeat"), kind: (kind) => (types.has(kind) ? types(kind) : kind) }), listDrivers(id)]);
+  early.catch(() => null);
+  const reservation = await getReservation(id);
+  if (!reservation) notFound();
+  if (reservation.status !== "CONFIRMED") redirect(`/reservations/${id}`);
+
+  const supabase = await createClient();
+  const [[requests, drivers], { data: vehicle }, { data: customer }, photos, connected, money] = await Promise.all([
+    early,
+    reservation.assigned_vehicle_id
+      ? supabase.from("vehicles").select("fleet_number, vin, license_plate, odometer, battery_level").eq("id", reservation.assigned_vehicle_id).maybeSingle()
+      : Promise.resolve({ data: null }),
+    reservation.customer ? supabase.from("customers").select("stripe_payment_method_id, license_kind, license_kind_confirmed").eq("id", reservation.customer.id).maybeSingle() : Promise.resolve({ data: null }),
+    reservation.assigned_vehicle_id ? vehiclePhotoProgress(reservation.assigned_vehicle_id) : Promise.resolve(null),
+    reservation.assigned_vehicle_id ? teslaReady() : Promise.resolve(false),
+    loadPickupMoney(id),
+  ]);
+  const holdCents = reservation.security_hold_cents + (reservation.quote_snapshot?.depositCents ?? 0);
+  const tesla = vehicle?.vin ? connected : false;
+  const signed = reservation.agreement_state === "SIGNED";
+  const card = customer?.stripe_payment_method_id ?? null;
+  const hasCard = Boolean(card);
+  const cardReady = hasCard && stripeConfigured();
+  const holdAuthorized = reservation.hold_state === "AUTHORIZED" || holdCents <= 0;
+  const hold: PayStage = holdAuthorized ? "done" : !cardReady || money.holdRefused.includes(card ?? "") ? "blocked" : "open";
+  const rent: PayStage = money.rentDueCents <= 0 ? "done" : !cardReady || money.rentRefused.includes(card ?? "") ? "blocked" : "open";
+
+  const insuranceGate: InsuranceGate = protectionAllowed(reservation.protection, customer?.license_kind) ? (reservation.insurance_state as InsuranceGate) : "UPGRADE";
+  const gates: Array<{ step: number; label: string; value: string; ok: boolean; href?: string; hrefLabel?: string }> = [
+    { step: 1, label: t("vehicle"), value: vehicle ? [vehicle.fleet_number, vehicle.license_plate, vehicle.vin].filter(Boolean).join(" · ") : "—", ok: Boolean(vehicle) },
+    ...(photos ? [{ step: 1, label: t("photos"), value: `${photos.done} / ${photos.total}`, ok: photos.missing.length === 0, href: photos.missing.length ? withBack(`/fleet/${reservation.assigned_vehicle_id}`, `/reservations/${id}/pickup`) : undefined, hrefLabel: t("photosFix") }] : []),
+    { step: 1, label: t("license"), value: r(`state.${reservation.verification_state}`), ok: reservation.verification_state === "VERIFIED" },
+    ...(reservation.extra_drivers > 0 ? [{ step: 1, label: t("drivers"), value: `${drivers.filter((driver) => driverDone(driver.status)).length} / ${reservation.extra_drivers}`, ok: (reservation.drivers_pending ?? 0) === 0 }] : []),
+    ...(insuranceGate !== "NOT_REQUIRED" ? [{ step: 1, label: t("insurance"), value: t(`insuranceStatus.${insuranceGate}`), ok: insuranceGate !== "UPGRADE" && insuranceOk(insuranceGate) }] : []),
+    {
+      step: 2,
+      label: t("agreement"),
+      value: r(`state.${reservation.agreement_state}`),
+      ok: signed,
+      href: signed ? withBack(`/reservations/${id}/agreement`, `/reservations/${id}/pickup`) : `/reservations/${id}/sign`,
+      hrefLabel: signed ? t("viewAgreement") : t("signHere"),
+    },
+  ];
+  const stepTitles: Record<number, string> = { 1: t("stepVerify"), 2: t("stepAgreement") };
+
+  return (
+    <>
+      <BackLink href={`/reservations/${id}`} />
+      <PageHeader eyebrow={reservation.number} title={t("pickup")} lead={`${reservation.customer?.full_name ?? ""} · ${formatFullDateTime(reservation.pickup_at)}`} />
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+        <section className="card p-6">
+          <h2 className="mb-3 text-sm font-semibold">{t("gates")}</h2>
+          <dl className="flex flex-col gap-2.5">
+            {gates.map((gate, index) => (
+              <div key={gate.label} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 text-[13px]">
+                {(index === 0 || gates[index - 1].step !== gate.step) && stepHead(gate.step, stepTitles[gate.step])}
+                <dt className="text-charcoal">
+                  {gate.label}
+                  {gate.href && (
+                    <Link href={gate.href} className="ml-2 text-[11px] text-charcoal underline decoration-gold/50 underline-offset-2 hover:decoration-gold">
+                      {gate.hrefLabel}
+                    </Link>
+                  )}
+                </dt>
+                <dd className="flex items-center gap-2 text-right">
+                  <span className="text-muted">{gate.value}</span>
+                  <Badge tone={gate.ok ? "success" : "warning"}>{gate.ok ? "✓" : "…"}</Badge>
+                </dd>
+              </div>
+            ))}
+          </dl>
+          <div className="mt-2.5">
+            {stepHead(3, t("stepPayment"))}
+            <PickupPayments
+              reservationId={id}
+              holdCents={holdCents}
+              holdAuthorized={holdAuthorized}
+              rentDueCents={money.rentDueCents}
+              hasCard={hasCard}
+              payNow={reservation.rate_plan === "PAY_NOW"}
+              offlineHref={staff.permissions.has("payment.capture") ? `/reservations/${id}#payments` : null}
+            />
+          </div>
+          <VerifyPanel reservationId={id} licenseVerified={reservation.verification_state === "VERIFIED"} licenseKind={customer?.license_kind ?? "US"} licenseKindConfirmed={Boolean(customer?.license_kind_confirmed)} drivers={drivers} insurance={{ state: insuranceGate, proofPath: reservation.insurance_proof_path }} />
+        </section>
+        <section className="card p-6">
+          <PickupForm
+            reservationId={id}
+            hasChildSeat={reservation.add_ons.includes("childSeat")}
+            odometer={vehicle?.odometer ?? null}
+            battery={vehicle?.battery_level ?? null}
+            canOverride={staff.permissions.has("handover.override")}
+            canWaiveHold={staff.permissions.has("handover.no_hold")}
+            hold={hold}
+            rent={rent}
+            requests={requests}
+            videoEnabled={r2Configured()}
+            teslaVin={tesla ? (vehicle?.vin ?? null) : null}
+          />
+        </section>
+      </div>
+    </>
+  );
+}
